@@ -1,8 +1,8 @@
-# Ray Worker Internals: Process Lifecycle, Job Isolation, and venv Propagation
+# Ray Worker Internals: Process Lifecycle, Job Isolation, venv Propagation, and Cluster Communication
 
 This document explains how Ray creates and manages worker processes, how tasks are
-assigned to workers, how runtime environments (venvs) are set up, and what the actual
-isolation guarantees are between jobs.
+assigned to workers, how runtime environments (venvs) are set up, how head and worker
+nodes communicate, and how `ray job submit` and `ray.init()` (Ray Client) differ.
 
 All source references are relative to the Ray repository root.
 
@@ -288,24 +288,7 @@ to zero, the venv directory is eligible for deletion.  Cache size is bounded by
 
 ---
 
-## 5. Head Node vs Worker Node Differences
-
-| Component | Head node | Worker node |
-|---|---|---|
-| GCS Server | ✅ runs here | ❌ |
-| Driver process | ✅ by default | ❌ |
-| RuntimeEnv Agent | ✅ | ✅ (one per node) |
-| Raylet | ✅ | ✅ |
-| Worker processes | ✅ | ✅ |
-| Object Store (Plasma) | ✅ | ✅ |
-
-The worker pool logic (including job binding, idle worker selection, and kill-on-finish)
-runs identically on every node.  The head node is not special from a worker-lifecycle
-perspective.
-
----
-
-## 6. Summary: Isolation Guarantees
+## 5. Summary: Isolation Guarantees
 
 | Scenario | Isolated? | Explanation |
 |---|---|---|
@@ -319,16 +302,362 @@ perspective.
 
 ---
 
-## 7. Key Source Files
+## 8. Head Node ↔ Worker Node Communication
+
+### 8.1 Cluster topology
+
+Every node (head and workers) runs the same pair of daemons:
+
+```
+┌─ Head Node ──────────────────────────────────────────────────────────┐
+│  GCS Server          ← single cluster-wide authority for metadata    │
+│  Raylet              ← local scheduler + worker pool                 │
+│  RuntimeEnv Agent    ← local venv installer                          │
+│  Dashboard / JobHead ← HTTP API gateway                              │
+│  Object Store        ← local Plasma store                            │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ Worker Node ────────────────────────────────────────────────────────┐
+│  Raylet              ← local scheduler + worker pool                 │
+│  RuntimeEnv Agent    ← local venv installer (independent of head)   │
+│  Object Store        ← local Plasma store                            │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 Worker node registration (join flow)
+
+When a worker node boots its raylet calls `RegisterGcs()` (`node_manager.cc:305`).
+This sends a `RegisterNode` RPC to GCS on the head node.
+
+GCS handler (`gcs_node_manager.cc:102-156`):
+1. Writes node metadata (address, port, resources, labels) to `NodeTable` in GCS storage.
+2. Adds node to in-memory `alive_nodes_` map.
+3. Broadcasts `PublishNodeInfoToPubsub()` so every other raylet learns about the new peer.
+
+All subsequent raylets subscribe to this pubsub feed and update their local view of the
+cluster without polling GCS again.
+
+### 8.3 Resource reporting — RaySyncer
+
+Each raylet periodically broadcasts its resource availability to all peers through the
+**RaySyncer** subsystem (a lightweight gossip protocol over gRPC).
+
+```
+Worker node raylet
+  │
+  │  every report_resources_period_ms
+  ▼
+LocalResourceManager::CreateSyncMessage()   ← local_resource_manager.cc:423
+  creates RESOURCE_VIEW message with:
+    resources_total, resources_available, resource_load
+  │
+  ▼
+RaySyncer sends to every connected peer (other raylets + GCS)
+  │
+  ├─► Head node GCS
+  │     GcsNodeManager::UpdateAliveNode()  ← gcs_node_manager.cc:232
+  │     Keeps per-node resource snapshot for autoscaler
+  │
+  └─► All other raylets
+        Each raylet updates its local ClusterResourceManager view
+        Used for scheduling decisions without needing to query GCS
+```
+
+This means **scheduling is fully decentralised** — each raylet makes placement decisions
+using its local (eventually-consistent) copy of cluster resources.
+
+### 8.4 Cross-node task scheduling
+
+When a task cannot be satisfied locally (not enough resources), the local raylet spills it:
+
+```
+Driver submits task to local raylet via RequestWorkerLease RPC
+  │
+  ▼
+node_manager.cc:HandleRequestWorkerLease()
+  │
+  ▼
+ClusterLeaseManager::ScheduleAndGrantLeases()  ← cluster_lease_manager.cc:196
+  calls GetBestSchedulableNode() to pick target
+  │
+  ├── target = local node  →  PopWorker() → assign to idle/new worker
+  │
+  └── target = remote node  →  AllocateRemoteTaskResources()
+                                 then forwards RequestWorkerLease RPC
+                                 directly to the remote node's raylet
+                                 (node-to-node gRPC, not through head)
+```
+
+Key point: **inter-raylet task forwarding is peer-to-peer — it does not go through the
+head node or GCS.** Head-node GCS is only consulted for initial node discovery and
+autoscaler decisions.
+
+### 8.5 Cross-node object transfer
+
+When a task on node B needs an object that lives in node A's Plasma store:
+
+```
+Core worker on node B calls ray.get(ref)
+  │
+  ▼
+ObjectManager::Pull()   ← pull_manager.cc:52
+  queries GCS for object locations  (one-time lookup)
+  │
+  ▼
+PullManager sends Pull RPC directly to node A's ObjectManager
+  │
+  ▼
+Node A's ObjectManager pushes object bytes over gRPC to node B
+  │
+  ▼
+Object lands in node B's Plasma store
+Core worker on node B deserialises the result
+```
+
+Object transfers are **direct node-to-node**; head node is only involved in the
+initial location lookup stored in GCS.
+
+### 8.6 RuntimeEnv Agent — local per node
+
+Each node runs **its own** RuntimeEnv Agent; there is no central venv server on the head.
+
+```
+Worker node raylet needs a venv for an incoming task
+  │
+  ▼
+WorkerPool::StartNewWorker()
+  calls runtime_env_agent_client_.GetOrCreateRuntimeEnv()
+  via HTTP POST to localhost:<agent_port>/get_or_create_runtime_env
+  ← runtime_env_agent_client.cc:367
+  │
+  ▼
+Local RuntimeEnv Agent installs the venv on this node's disk
+Returns RuntimeEnvContext JSON (py_executable path etc.)
+  │
+  ▼
+Raylet spawns worker process with that context
+```
+
+If the same spec was already installed by a previous job on this node, the agent returns
+the cached path immediately (no network involved).
+
+Working-dir archives are fetched from the GCS internal KV store (where the submitter
+uploaded them) — this is the one step that does go through the head node.
+
+---
+
+## 9. `ray job submit` — Code from Laptop to Cluster
+
+### 9.1 Overview
+
+```
+Laptop (ray job submit)
+  │  HTTP
+  ▼
+Head node Dashboard (port 8265)
+  │  HTTP (internal)
+  ▼
+Job Agent (Dashboard plugin)
+  │  Ray actor spawn
+  ▼
+JobSupervisor actor (on head node worker)
+  │  subprocess.Popen
+  ▼
+Driver process running on head node
+  │  CoreWorker gRPC
+  ▼
+Raylets on head + worker nodes (task execution)
+```
+
+### 9.2 Step-by-step
+
+**1. CLI entry point** (`dashboard/modules/job/cli.py:218`)
+
+`ray job submit` calls `JobSubmissionClient.submit_job()`.
+
+**2. Working-dir upload** (`dashboard/modules/dashboard_sdk.py:420`)
+
+Before the job is submitted, the client packages the local `working_dir` into a zip
+archive and uploads it via:
+```
+PUT http://<head>:8265/api/packages/{protocol}/{hash}
+```
+The archive is stored in the GCS internal KV store under a content-addressed key so
+all nodes can fetch it. (`job_head.py:373`, `dashboard_sdk.py:355`)
+
+**3. HTTP job submission** (`sdk.py:262`)
+
+```
+POST http://<head>:8265/api/jobs/
+Body: { entrypoint, runtime_env, metadata, ... }
+```
+
+**4. Head node routing** (`job_head.py:397-407`)
+
+`JobHead` picks a job agent (Dashboard agent process) and forwards the request:
+```
+POST http://localhost:<agent_port>/api/job_agent/jobs/
+```
+
+**5. JobManager creates supervisor actor** (`job_manager.py:537-616`)
+
+- Writes `JobInfo` with status `PENDING` to GCS internal KV store.
+- Spawns a `JobSupervisor` Ray actor (this runs inside the cluster on the head node
+  by default, since `num_cpus=0` lets it land without consuming CPU slots).
+
+**6. Driver subprocess** (`job_supervisor.py:155-200`)
+
+`JobSupervisor.run()` calls `subprocess.Popen(entrypoint, shell=True, ...)`.
+The driver process is a plain OS process on the head node.
+Key env vars set for it:
+- `RAY_ADDRESS` — so `ray.init()` inside the script auto-connects
+- `RAY_JOB_CONFIG_JSON_ENV_VAR` — carries the runtime_env and metadata
+
+**7. Status tracking**
+
+`JobSupervisor` polls the subprocess return code and writes status transitions
+(`PENDING → RUNNING → SUCCEEDED/FAILED`) back to GCS KV (`common.py:278`).
+
+The submitter polls `GET /api/jobs/{job_id}` which reads from the same GCS KV.
+
+### 9.3 Where things run
+
+| Component | Runs on |
+|---|---|
+| `ray job submit` CLI | Laptop (outside cluster) |
+| JobHead / Dashboard | Head node |
+| JobSupervisor actor | Head node (num_cpus=0 actor) |
+| Driver process (entrypoint) | Head node subprocess |
+| Tasks and actors from the driver | Any node (scheduled by raylets) |
+
+---
+
+## 10. `ray.init()` — Attached / Ray Client Mode
+
+### 10.1 Two sub-modes of ray.init()
+
+| Invocation | Mode | Driver location |
+|---|---|---|
+| `ray.init()` (no address) | **Local** — starts a mini cluster in-process | Same machine |
+| `ray.init(address="auto")` | **Direct** — connects as native driver to existing cluster | Same machine as head |
+| `ray.init(address="ray://host:10001")` | **Ray Client** — connects over gRPC from anywhere | Laptop / CI / anywhere |
+
+### 10.2 ray.init() — local mode
+
+`worker.py:1947` spawns a `Node(head=True)` which starts all Ray system processes
+(GCS, Raylet, Plasma, Dashboard) as subprocesses. The driver then connects to this
+mini cluster as a native CoreWorker (`worker.py:2709`).
+
+### 10.3 ray.init() — direct mode (address="auto" or IP)
+
+The driver connects its C++ CoreWorker directly to the cluster's GCS and raylet.
+No gRPC proxy layer — the driver registers a job and submits tasks with the same
+low-latency path as a job-submit driver. This mode requires the driver to be on a
+machine that has network access to internal cluster ports (raylet ports, GCS port).
+
+### 10.4 ray.init() — Ray Client mode (address="ray://...")
+
+```
+Laptop
+  ray.init("ray://head:10001")
+  │
+  │  gRPC (port 10001, bidirectional stream)
+  ▼
+Head node — Ray Client Server (ray/util/client/server/server.py)
+  │
+  │  Native in-process CoreWorker calls
+  ▼
+GCS + Raylets (task scheduling, object store)
+```
+
+**Code path** (`worker.py:1711`):
+```python
+# worker.py:1711-1713
+if address is not None and "://" in address:
+    builder = ray.client(address, ...)
+    return builder.connect()
+```
+
+`ClientBuilder.connect()` (`client_builder.py:136`) establishes a gRPC channel to the
+Ray Client Server and calls `Init` RPC to negotiate the session.
+
+**The `RayletDriver` gRPC service** (`src/ray/protobuf/ray_client.proto:324`) exposes:
+
+| RPC | Purpose |
+|---|---|
+| `Init` | Establish session, send JobConfig |
+| `Schedule(ClientTask)` | Submit a remote() call; returns ObjectRef ID |
+| `GetObject(ref)` | Fetch object value from cluster object store |
+| `PutObject(value)` | Upload object to cluster object store |
+| `WaitObject` | ray.wait() |
+| `KVGet/Put/Del/List` | Ray internal KV operations |
+| `Datapath` (streaming) | Bidirectional stream multiplexing all data ops |
+
+**How `my_task.remote()` works in client mode** (`client/worker.py:631`):
+
+1. Client serialises function + args into a `ClientTask` proto.
+2. Sends it via `data_client.Schedule(task)` over the gRPC `Datapath` stream.
+3. Server-side (`server.py:608`) deserialises and calls the real `remote_func.remote()`
+   **on the cluster** — the task is dispatched into Ray's native scheduling path.
+4. Server returns the ObjectRef ID to the client.
+5. Client calls `GetObject(ref)` over gRPC only when `ray.get()` is called — not eagerly.
+
+### 10.5 Key differences: Ray Client vs job submit
+
+| Aspect | `ray job submit` | `ray.init("ray://...")` Ray Client |
+|---|---|---|
+| **Driver location** | Head node subprocess | Laptop / external machine |
+| **Connection protocol** | No proxy; driver is native CoreWorker on head | gRPC bidirectional stream through Ray Client Server |
+| **Task submission path** | Direct CoreWorker → Raylet | Client → gRPC → Client Server → CoreWorker → Raylet |
+| **Latency per task** | ~microseconds (local IPC) | ~milliseconds (gRPC round-trip per Schedule call) |
+| **Serialisation boundary** | None — driver and workers share same cluster | All args/results serialised over gRPC |
+| **Network drop** | Job keeps running; only affects log streaming | Session may be lost; reconnect attempted within `reconnect_grace_period` |
+| **Job lifetime** | Independent of submitter; survives terminal close | Tied to gRPC session (configurable grace period) |
+| **Large object args** | Stored in local Plasma, passed by ref | Must be `ray.put()` first; otherwise serialised through gRPC |
+| **Working dir** | Uploaded as zip before submission | Specified in runtime_env; uploaded same way |
+| **Recommended for** | Production, CI, batch jobs | Interactive notebooks, debugging, REPL |
+
+### 10.6 Driver registration with GCS
+
+Both modes end up registering a job with GCS. For a job-submit driver:
+
+```python
+# worker.py:2573  (inside connect())
+job_id = ray._private.state.next_job_id()   # GCS call to allocate ID
+
+# worker.py:2709
+CoreWorker(mode=SCRIPT_MODE, job_id=job_id, ...)
+# CoreWorker C++ constructor sends RegisterJob RPC to GCS
+# GCS stores JobTableData: job_id, driver_ip, driver_pid, start_time, config
+```
+
+For Ray Client, the registration happens on the **server side** when the `Init` RPC
+is processed (`server.py:146`) — the client itself never touches GCS directly.
+
+---
+
+## 11. Key Source Files (updated)
 
 | File | What it does |
 |---|---|
 | `src/ray/raylet/worker_pool.cc` | Worker pool: idle reuse, job matching, kill-on-finish |
 | `src/ray/raylet/worker.cc` | Per-worker state; `SetJobId()` one-time binding |
 | `src/ray/core_worker/context.cc` | `MaybeInitializeJobInfo()` — job binding inside worker |
+| `src/ray/raylet/node_manager.cc` | Task lease handling, resource reporting, node registration |
+| `src/ray/raylet/scheduling/cluster_lease_manager.cc` | Cross-node task scheduling logic |
+| `src/ray/gcs/gcs_node_manager.cc` | Node registration and pubsub on head |
+| `src/ray/object_manager/pull_manager.cc` | Cross-node object pull protocol |
 | `python/ray/_private/workers/default_worker.py` | Worker entry point; deserialises RuntimeEnvContext |
 | `python/ray/_private/runtime_env/agent/runtime_env_agent.py` | venv install orchestration, caching, locking |
 | `python/ray/_private/runtime_env/pip.py` | pip install logic, hash computation, context modification |
 | `python/ray/_private/runtime_env/uv.py` | uv install logic (same structure as pip.py) |
 | `python/ray/_private/runtime_env/context.py` | `RuntimeEnvContext` — carries py_executable + env_vars to worker |
 | `python/ray/_private/runtime_env/uri_cache.py` | Reference-counted venv cache with size-based eviction |
+| `python/ray/dashboard/modules/job/job_manager.py` | JobManager: supervisor actor creation, status tracking |
+| `python/ray/dashboard/modules/job/job_supervisor.py` | Driver subprocess spawn, log streaming |
+| `python/ray/dashboard/modules/job/sdk.py` | `JobSubmissionClient` — HTTP client for job API |
+| `python/ray/dashboard/modules/job/job_head.py` | Dashboard HTTP endpoints for job submission |
+| `python/ray/util/client/server/server.py` | Ray Client Server: `Schedule`, `Init`, `GetObject` RPCs |
+| `python/ray/util/client/worker.py` | Ray Client: sends `Schedule` RPC for each `remote()` call |
+| `src/ray/protobuf/ray_client.proto` | `RayletDriver` gRPC service definition |
+| `python/ray/_private/worker.py` | `ray.init()` — routing between local/direct/client modes |
